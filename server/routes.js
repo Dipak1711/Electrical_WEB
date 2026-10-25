@@ -1,51 +1,51 @@
 const express = require('express');
-const { D, tx, nextCode, isUniqueViolation } = require('./db');
+const { sb, unwrap, countOf, fetchAll, nextCode, isUniqueViolation } = require('./db');
 const storage = require('./storage');
 const { requireAdmin } = require('./auth');
 const V = require('./validate');
 
 const { bad, HttpError } = V;
+
 // photos are stored in Supabase Storage; the database keeps only the file name, the API hands out the full public URL
 const withImage = (p) => (p ? { ...p, image: storage.publicUrl(p.image) } : p);
+const byName = (a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
+const now = () => new Date().toISOString();
 
 // ---------------------------------------------------------------- public (customers)
 // Only fields meant for customers, and only active products (priced or not). Purchase price, minimum stock, supplier and notes never leave the admin routes.
 const publicRouter = express.Router();
 
 async function categoriesTree() {
-  const cats = await D.all('SELECT id, name, icon FROM categories ORDER BY sort, name');
-  const subs = await D.all('SELECT id, category_id, name FROM subcategories ORDER BY sort, name');
+  const cats = await unwrap(sb.from('categories').select('id,name,icon').order('sort').order('name'));
+  const subs = await unwrap(sb.from('subcategories').select('id,category_id,name').order('sort').order('name'));
   return cats.map((c) => ({ ...c, subcategories: subs.filter((s) => s.category_id === c.id).map(({ id, name }) => ({ id, name })) }));
 }
 
 publicRouter.get('/catalog', async (req, res) => {
-  const products = await D.all(
-    `SELECT id, name, brand, model, spec, category_id, subcategory_id, unit, sell_price, stock, image, keywords
-     FROM products WHERE active = 1 ORDER BY lower(name)`
-  );
-  res.json({ categories: await categoriesTree(), products: products.map(withImage) });
+  const cols = 'id,name,brand,model,spec,category_id,subcategory_id,unit,sell_price,stock,image,keywords';
+  const products = await fetchAll(() => sb.from('products').select(cols).eq('active', 1).order('id'));
+  res.json({ categories: await categoriesTree(), products: products.sort(byName).map(withImage) });
 });
 
 // ---------------------------------------------------------------- admin
 const admin = express.Router();
 admin.use(requireAdmin);
 
-const PRODUCT_COLS = `id, code, name, brand, model, spec, category_id, subcategory_id, unit, cost_price, sell_price,
-  stock, min_stock, target_stock, reorder_qty, supplier, last_purchase_price, image, keywords, notes, active, updated_at`;
+const PRODUCT_COLS = 'id,code,name,brand,model,spec,category_id,subcategory_id,unit,cost_price,sell_price,stock,min_stock,target_stock,reorder_qty,supplier,last_purchase_price,image,keywords,notes,active,updated_at';
 
 // raw = true keeps the stored file name (needed when deleting a photo)
-async function getProduct(id, d = D, raw = false) {
-  const p = await d.get(`SELECT ${PRODUCT_COLS} FROM products WHERE id = ?`, id);
+async function getProduct(id, raw = false) {
+  const p = await unwrap(sb.from('products').select(PRODUCT_COLS).eq('id', id).maybeSingle());
   if (!p) throw new HttpError(404, 'Product not found.');
   return raw ? p : withImage(p);
 }
 
 admin.get('/catalog', async (req, res) => {
-  const products = await D.all(`SELECT ${PRODUCT_COLS} FROM products ORDER BY lower(name)`);
-  res.json({ categories: await categoriesTree(), products: products.map(withImage) });
+  const products = await fetchAll(() => sb.from('products').select(PRODUCT_COLS).order('id'));
+  res.json({ categories: await categoriesTree(), products: products.sort(byName).map(withImage) });
 });
 
-async function cleanProduct(b, existing, d = D) {
+async function cleanProduct(b, existing) {
   const unit = V.text(b.unit ?? existing?.unit ?? 'Nos', 'Unit', { max: 10 });
   if (!V.UNITS.includes(unit)) throw bad(`Unit must be one of: ${V.UNITS.join(', ')}.`);
   const whole = V.WHOLE_UNITS.has(unit);
@@ -71,62 +71,54 @@ async function cleanProduct(b, existing, d = D) {
     subcategory_id: b.subcategory_id ? Number(b.subcategory_id) : null,
   };
   if (p.target_stock != null && p.min_stock != null && p.target_stock < p.min_stock) throw bad('Target stock cannot be lower than minimum stock.');
-  if (p.category_id && !(await d.get('SELECT 1 AS x FROM categories WHERE id = ?', p.category_id))) throw bad('Category not found.');
+  if (p.category_id && !(await unwrap(sb.from('categories').select('id').eq('id', p.category_id).maybeSingle()))) throw bad('Category not found.');
   if (p.subcategory_id) {
-    const s = await d.get('SELECT category_id FROM subcategories WHERE id = ?', p.subcategory_id);
+    const s = await unwrap(sb.from('subcategories').select('category_id').eq('id', p.subcategory_id).maybeSingle());
     if (!s) throw bad('Subcategory not found.');
     if (s.category_id !== p.category_id) throw bad('That subcategory does not belong to the chosen category.');
   }
   return p;
 }
 
-// Same code, or same name + brand + model + specification, counts as a duplicate.
-async function assertNotDuplicate(d, p, selfId) {
-  const self = selfId || -1;
-  if (p.code) {
-    const x = await d.get('SELECT name FROM products WHERE lower(code) = lower(?) AND id != ?', p.code, self);
-    if (x) throw new HttpError(409, `Product code ${p.code} is already used by "${x.name}".`);
-  }
-  const x = await d.get(
-    'SELECT code FROM products WHERE lower(name)=lower(?) AND lower(brand)=lower(?) AND lower(model)=lower(?) AND lower(spec)=lower(?) AND id != ?',
-    p.name, p.brand, p.model, p.spec, self
-  );
-  if (x) throw new HttpError(409, `This product already exists (${x.code}). Edit it instead, or change the brand / model / specification.`);
+// The database refuses a repeated code, or a repeated name + brand + model + specification (unique indexes).
+function duplicateError(e) {
+  if (!isUniqueViolation(e)) return e;
+  if (/products_code_uq/.test(e.message)) return new HttpError(409, 'That product code is already used by another product.');
+  return new HttpError(409, 'This product already exists. Edit it instead, or change the brand / model / specification.');
 }
 
+const PRODUCT_FIELDS = ['code', 'name', 'brand', 'model', 'spec', 'category_id', 'subcategory_id', 'unit', 'cost_price', 'sell_price', 'min_stock', 'target_stock', 'reorder_qty', 'supplier', 'last_purchase_price', 'keywords', 'notes', 'active'];
+const pick = (p) => Object.fromEntries(PRODUCT_FIELDS.map((k) => [k, p[k]]));
+
 admin.post('/products', async (req, res) => {
-  const created = await tx(async (t) => {
-    const p = await cleanProduct(req.body || {}, undefined, t);
-    if (!p.code) p.code = await nextCode(t);
-    await assertNotDuplicate(t, p);
-    const r = await t.get(
-      `INSERT INTO products (code,name,brand,model,spec,category_id,subcategory_id,unit,cost_price,sell_price,min_stock,target_stock,reorder_qty,supplier,last_purchase_price,keywords,notes,active)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id`,
-      p.code, p.name, p.brand, p.model, p.spec, p.category_id, p.subcategory_id, p.unit, p.cost_price, p.sell_price, p.min_stock, p.target_stock, p.reorder_qty, p.supplier, p.last_purchase_price, p.keywords, p.notes, p.active
-    );
-    // Opening stock is recorded as a movement so the history always adds up.
-    if (p.stock != null) {
-      await t.run('UPDATE products SET stock = ? WHERE id = ?', p.stock, r.id);
-      if (p.stock > 0) await addMovement(t, r.id, 'adjustment', p.stock, p.stock, null, '', 'Opening stock', V.today());
+  const p = await cleanProduct(req.body || {});
+  const autoCode = !p.code;
+  let created;
+  for (let attempt = 0; ; attempt++) {
+    if (autoCode) p.code = await nextCode();
+    try {
+      created = await unwrap(sb.from('products').insert(pick(p)).select('id').single());
+      break;
+    } catch (e) {
+      if (autoCode && attempt < 3 && isUniqueViolation(e) && /products_code_uq/.test(e.message)) continue; // two people created at the same moment
+      throw duplicateError(e);
     }
-    return r.id;
-  });
-  res.status(201).json(await getProduct(created));
+  }
+  // Opening stock is recorded as a movement so the history always adds up.
+  if (p.stock != null && p.stock > 0) await moveStock({ id: created.id, type: 'adjustment', target: p.stock, note: 'Opening stock', date: V.today() });
+  res.status(201).json(await getProduct(created.id));
 });
 
 admin.put('/products/:id', async (req, res) => {
   const id = Number(req.params.id);
-  await tx(async (t) => {
-    const existing = await getProduct(id, t);
-    const p = await cleanProduct({ ...req.body, code: req.body?.code || existing.code }, existing, t);
-    await assertNotDuplicate(t, p, id);
-    // Stock is changed through Receive / Sale / Adjust so the history stays correct; edits here never touch it.
-    await t.run(
-      `UPDATE products SET code=?, name=?, brand=?, model=?, spec=?, category_id=?, subcategory_id=?, unit=?, cost_price=?, sell_price=?,
-        min_stock=?, target_stock=?, reorder_qty=?, supplier=?, last_purchase_price=?, keywords=?, notes=?, active=?, updated_at=now() WHERE id=?`,
-      p.code, p.name, p.brand, p.model, p.spec, p.category_id, p.subcategory_id, p.unit, p.cost_price, p.sell_price, p.min_stock, p.target_stock, p.reorder_qty, p.supplier, p.last_purchase_price, p.keywords, p.notes, p.active, id
-    );
-  });
+  const existing = await getProduct(id);
+  const p = await cleanProduct({ ...req.body, code: req.body?.code || existing.code }, existing);
+  // Stock is changed through Receive / Sale / Adjust so the history stays correct; edits here never touch it.
+  try {
+    await unwrap(sb.from('products').update({ ...pick(p), updated_at: now() }).eq('id', id));
+  } catch (e) {
+    throw duplicateError(e);
+  }
   res.json(await getProduct(id));
 });
 
@@ -135,10 +127,10 @@ const IMG_TYPES = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp
 
 admin.post('/products/:id/image', async (req, res) => {
   const id = Number(req.params.id);
-  const old = await getProduct(id, D, true);
+  const old = await getProduct(id, true);
   const m = /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(req.body?.dataUrl || '');
   if (!m) throw bad('Please choose a JPG, PNG or WebP image.');
-  if (!storage.enabled) throw new HttpError(503, 'Photo storage is not set up. Add SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY to .env.');
+  if (!storage.enabled) throw new HttpError(503, 'Photo storage is not set up. Add SUPABASE_URL and SUPABASE_ANON_KEY to .env.');
   const buf = Buffer.from(m[2], 'base64');
   if (buf.length > 2 * 1024 * 1024) throw bad('Image is too large (max 2 MB).');
   const file = `p${id}-${Date.now()}.${IMG_TYPES[m[1]]}`;
@@ -147,15 +139,15 @@ admin.post('/products/:id/image', async (req, res) => {
   } catch (e) {
     throw new HttpError(502, e.message);
   }
-  await D.run('UPDATE products SET image=?, updated_at=now() WHERE id=?', file, id);
+  await unwrap(sb.from('products').update({ image: file, updated_at: now() }).eq('id', id));
   await storage.remove(old.image);
   res.json(await getProduct(id));
 });
 
 admin.delete('/products/:id/image', async (req, res) => {
   const id = Number(req.params.id);
-  const old = await getProduct(id, D, true);
-  await D.run('UPDATE products SET image=NULL, updated_at=now() WHERE id=?', id);
+  const old = await getProduct(id, true);
+  await unwrap(sb.from('products').update({ image: null, updated_at: now() }).eq('id', id));
   await storage.remove(old.image);
   res.json(await getProduct(id));
 });
@@ -164,149 +156,133 @@ admin.delete('/products/:id/image', async (req, res) => {
 const uniqueOr409 = (msg) => (e) => {
   throw isUniqueViolation(e) ? new HttpError(409, msg) : e;
 };
+const nextSort = async (table, filter) => {
+  let q = sb.from(table).select('sort').order('sort', { ascending: false }).limit(1);
+  if (filter) q = q.eq(...filter);
+  const rows = await unwrap(q);
+  return (rows[0]?.sort ?? 0) + 1;
+};
 
 admin.post('/categories', async (req, res) => {
   const name = V.text(req.body?.name, 'Category name', { required: true, max: 60 });
   const icon = V.text(req.body?.icon || 'box', 'Icon', { max: 20 });
-  const sort = (await D.get('SELECT COALESCE(MAX(sort),0)+1 AS n FROM categories')).n;
-  const r = await D.get('INSERT INTO categories (name, icon, sort) VALUES (?,?,?) RETURNING id', name, icon, sort).catch(uniqueOr409('A category with this name already exists.'));
+  const r = await unwrap(sb.from('categories').insert({ name, icon, sort: await nextSort('categories') }).select('id').single()).catch(uniqueOr409('A category with this name already exists.'));
   res.status(201).json({ id: r.id, name, icon });
 });
 admin.put('/categories/:id', async (req, res) => {
   const name = V.text(req.body?.name, 'Category name', { required: true, max: 60 });
   const icon = V.text(req.body?.icon || 'box', 'Icon', { max: 20 });
-  const r = await D.run('UPDATE categories SET name=?, icon=? WHERE id=?', name, icon, Number(req.params.id)).catch(uniqueOr409('A category with this name already exists.'));
-  if (!r.changes) throw new HttpError(404, 'Category not found.');
+  const rows = await unwrap(sb.from('categories').update({ name, icon }).eq('id', Number(req.params.id)).select('id')).catch(uniqueOr409('A category with this name already exists.'));
+  if (!rows.length) throw new HttpError(404, 'Category not found.');
   res.json({ ok: true });
 });
 admin.delete('/categories/:id', async (req, res) => {
   const id = Number(req.params.id);
-  const used = (await D.get('SELECT COUNT(*) AS n FROM products WHERE category_id=?', id)).n;
+  const used = await countOf(sb.from('products').select('id', { count: 'exact', head: true }).eq('category_id', id));
   if (used) throw new HttpError(409, `${used} product(s) use this category. Move them first.`);
-  await tx(async (t) => {
-    await t.run('DELETE FROM subcategories WHERE category_id=?', id);
-    await t.run('DELETE FROM categories WHERE id=?', id);
-  });
+  await unwrap(sb.from('subcategories').delete().eq('category_id', id));
+  await unwrap(sb.from('categories').delete().eq('id', id));
   res.json({ ok: true });
 });
 admin.post('/subcategories', async (req, res) => {
   const name = V.text(req.body?.name, 'Subcategory name', { required: true, max: 60 });
   const cid = Number(req.body?.category_id);
-  if (!(await D.get('SELECT 1 AS x FROM categories WHERE id=?', cid))) throw bad('Choose a category.');
-  const sort = (await D.get('SELECT COALESCE(MAX(sort),0)+1 AS n FROM subcategories WHERE category_id=?', cid)).n;
-  const r = await D.get('INSERT INTO subcategories (category_id, name, sort) VALUES (?,?,?) RETURNING id', cid, name, sort).catch(uniqueOr409('This subcategory already exists in that category.'));
+  if (!(await unwrap(sb.from('categories').select('id').eq('id', cid).maybeSingle()))) throw bad('Choose a category.');
+  const r = await unwrap(sb.from('subcategories').insert({ category_id: cid, name, sort: await nextSort('subcategories', ['category_id', cid]) }).select('id').single()).catch(uniqueOr409('This subcategory already exists in that category.'));
   res.status(201).json({ id: r.id, category_id: cid, name });
 });
 admin.put('/subcategories/:id', async (req, res) => {
   const name = V.text(req.body?.name, 'Subcategory name', { required: true, max: 60 });
-  const r = await D.run('UPDATE subcategories SET name=? WHERE id=?', name, Number(req.params.id)).catch(uniqueOr409('This subcategory already exists in that category.'));
-  if (!r.changes) throw new HttpError(404, 'Subcategory not found.');
+  const rows = await unwrap(sb.from('subcategories').update({ name }).eq('id', Number(req.params.id)).select('id')).catch(uniqueOr409('This subcategory already exists in that category.'));
+  if (!rows.length) throw new HttpError(404, 'Subcategory not found.');
   res.json({ ok: true });
 });
 admin.delete('/subcategories/:id', async (req, res) => {
   const id = Number(req.params.id);
-  const used = (await D.get('SELECT COUNT(*) AS n FROM products WHERE subcategory_id=?', id)).n;
+  const used = await countOf(sb.from('products').select('id', { count: 'exact', head: true }).eq('subcategory_id', id));
   if (used) throw new HttpError(409, `${used} product(s) use this subcategory. Move them first.`);
-  await D.run('DELETE FROM subcategories WHERE id=?', id);
+  await unwrap(sb.from('subcategories').delete().eq('id', id));
   res.json({ ok: true });
 });
 
-// ---- stock: receive / sale / adjust. All three run in one transaction with the movement row.
-async function addMovement(t, productId, type, change, balance, price, supplier, note, date) {
-  await t.run('INSERT INTO stock_movements (product_id,type,qty_change,balance_after,unit_price,supplier,note,date) VALUES (?,?,?,?,?,?,?,?)', productId, type, change, balance, price, supplier, note, date);
-}
+// ---- stock: receive / sale / adjust. The database function changes the stock and writes the history row in one step.
 const unitIsWhole = (p) => V.WHOLE_UNITS.has(p.unit);
-// lock the product row so two simultaneous sales cannot both pass the stock check
-const lockProduct = (t, id) => t.get(`SELECT ${PRODUCT_COLS} FROM products WHERE id = ? FOR UPDATE`, id).then((p) => {
-  if (!p) throw new HttpError(404, 'Product not found.');
-  return p;
-});
+
+async function moveStock({ id, type, qty = null, price = null, supplier = '', note = '', date, updateCost = false, target = null, unit = 'Nos' }) {
+  const { data, error } = await sb.rpc('gk_move_stock', {
+    p_id: id, p_type: type, p_qty: qty, p_price: price, p_supplier: supplier, p_note: note, p_date: date, p_update_cost: updateCost, p_target: target,
+  });
+  if (error) {
+    const m = error.message || '';
+    if (m.includes('GK_INSUFFICIENT')) throw new HttpError(409, `Only ${m.split(':')[1]?.trim()} ${unit} in stock. Fix the quantity, or correct the stock with an adjustment first.`);
+    if (m.includes('GK_STOCK_UNSET')) throw new HttpError(409, 'Stock for this product is not set yet. Set the current stock first (Stock > Adjust).');
+    if (m.includes('GK_NOT_FOUND')) throw new HttpError(404, 'Product not found.');
+    if (/Could not find the function|schema cache/i.test(m)) throw new Error('Stock function missing. Run supabase/schema.sql in the Supabase SQL Editor.');
+    throw new Error(m);
+  }
+  return withImage(Array.isArray(data) ? data[0] : data);
+}
 
 admin.post('/stock/receive', async (req, res) => {
   const b = req.body || {};
-  const id = Number(b.product_id);
-  const out = await tx(async (t) => {
-    const p = await lockProduct(t, id);
-    const qty = V.positive(b.qty, 'Quantity received', { whole: unitIsWhole(p) });
-    const price = V.num(b.price, 'Purchase price');
-    const supplier = V.text(b.supplier, 'Supplier', { max: 80 }) || p.supplier;
-    const note = V.text(b.note, 'Note', { max: 200 });
-    const date = V.dateStr(b.date);
-    const balance = Math.round(((p.stock ?? 0) + qty) * 100) / 100;
-    const cost = b.update_cost && price != null ? price : p.cost_price;
-    await t.run('UPDATE products SET stock=?, supplier=?, last_purchase_price=?, cost_price=?, updated_at=now() WHERE id=?', balance, supplier, price ?? p.last_purchase_price, cost, id);
-    await addMovement(t, id, 'received', qty, balance, price, supplier, note, date);
-    return getProduct(id, t);
-  });
-  res.status(201).json(out);
+  const p = await getProduct(Number(b.product_id));
+  const qty = V.positive(b.qty, 'Quantity received', { whole: unitIsWhole(p) });
+  const price = V.num(b.price, 'Purchase price');
+  const supplier = V.text(b.supplier, 'Supplier', { max: 80 }) || p.supplier;
+  const note = V.text(b.note, 'Note', { max: 200 });
+  const date = V.dateStr(b.date);
+  res.status(201).json(await moveStock({ id: p.id, type: 'received', qty, price, supplier, note, date, updateCost: !!b.update_cost }));
 });
 
 admin.post('/sales', async (req, res) => {
   const b = req.body || {};
-  const id = Number(b.product_id);
-  const out = await tx(async (t) => {
-    const p = await lockProduct(t, id);
-    if (!p.active) throw new HttpError(409, 'This product is marked inactive.');
-    const qty = V.positive(b.qty, 'Quantity sold', { whole: unitIsWhole(p) });
-    const price = V.num(b.price ?? p.sell_price, 'Selling price');
-    if (price == null) throw bad('Enter the selling price for this sale (the product has none set).');
-    if (p.stock == null) throw new HttpError(409, 'Stock for this product is not set yet. Set the current stock first (Stock > Adjust).');
-    if (qty > p.stock) throw new HttpError(409, `Only ${p.stock} ${p.unit} in stock. Fix the quantity, or correct the stock with an adjustment first.`);
-    const balance = Math.round((p.stock - qty) * 100) / 100;
-    await t.run('UPDATE products SET stock=?, updated_at=now() WHERE id=?', balance, id);
-    await addMovement(t, id, 'sold', -qty, balance, price, '', V.text(b.note, 'Note', { max: 200 }), V.dateStr(b.date));
-    return getProduct(id, t);
-  });
-  res.status(201).json(out);
+  const p = await getProduct(Number(b.product_id));
+  if (!p.active) throw new HttpError(409, 'This product is marked inactive.');
+  const qty = V.positive(b.qty, 'Quantity sold', { whole: unitIsWhole(p) });
+  const price = V.num(b.price ?? p.sell_price, 'Selling price');
+  if (price == null) throw bad('Enter the selling price for this sale (the product has none set).');
+  const note = V.text(b.note, 'Note', { max: 200 });
+  const date = V.dateStr(b.date);
+  res.status(201).json(await moveStock({ id: p.id, type: 'sold', qty, price, note, date, unit: p.unit }));
 });
 
 admin.post('/stock/adjust', async (req, res) => {
   const b = req.body || {};
-  const id = Number(b.product_id);
-  const out = await tx(async (t) => {
-    const p = await lockProduct(t, id);
-    const target = Number(b.new_stock);
-    if (b.new_stock === '' || b.new_stock == null || !Number.isFinite(target)) throw bad('Enter the correct stock quantity.');
-    if (target < 0 && !b.allow_negative) throw bad('Stock cannot go below zero. Tick "allow negative" only if you really mean it.');
-    if (unitIsWhole(p) && !Number.isInteger(target)) throw bad('Stock must be a whole number for this unit.');
-    if (Math.abs(target) > 10_000_000) throw bad('Quantity is too large.');
-    const note = V.text(b.note, 'Reason', { required: true, max: 200 });
-    const balance = Math.round(target * 100) / 100;
-    const change = Math.round((balance - (p.stock ?? 0)) * 100) / 100;
-    await t.run('UPDATE products SET stock=?, updated_at=now() WHERE id=?', balance, id);
-    await addMovement(t, id, 'adjustment', change, balance, null, '', note, V.dateStr(b.date));
-    return getProduct(id, t);
-  });
-  res.status(201).json(out);
+  const p = await getProduct(Number(b.product_id));
+  const target = Number(b.new_stock);
+  if (b.new_stock === '' || b.new_stock == null || !Number.isFinite(target)) throw bad('Enter the correct stock quantity.');
+  if (target < 0 && !b.allow_negative) throw bad('Stock cannot go below zero. Tick "allow negative" only if you really mean it.');
+  if (unitIsWhole(p) && !Number.isInteger(target)) throw bad('Stock must be a whole number for this unit.');
+  if (Math.abs(target) > 10_000_000) throw bad('Quantity is too large.');
+  const note = V.text(b.note, 'Reason', { required: true, max: 200 });
+  const date = V.dateStr(b.date);
+  res.status(201).json(await moveStock({ id: p.id, type: 'adjustment', target, note, date }));
 });
 
 admin.get('/movements', async (req, res) => {
-  const where = [];
-  const args = [];
-  if (req.query.product_id) { where.push('m.product_id = ?'); args.push(Number(req.query.product_id)); }
-  if (['received', 'sold', 'adjustment'].includes(req.query.type)) { where.push('m.type = ?'); args.push(req.query.type); }
-  if (/^\d{4}-\d{2}-\d{2}$/.test(req.query.from || '')) { where.push('m.date >= ?'); args.push(req.query.from); }
-  if (/^\d{4}-\d{2}-\d{2}$/.test(req.query.to || '')) { where.push('m.date <= ?'); args.push(req.query.to); }
-  const limit = Math.min(Number(req.query.limit) || 100, 1000);
-  res.json(
-    await D.all(
-      `SELECT m.id, m.product_id, p.name, p.brand, p.spec, p.unit, m.type, m.qty_change, m.balance_after, m.unit_price, m.supplier, m.note, m.date, m.created_at
-       FROM stock_movements m JOIN products p ON p.id = m.product_id
-       ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY m.date DESC, m.id DESC LIMIT ${limit}`,
-      ...args
-    )
-  );
+  let q = sb
+    .from('stock_movements')
+    .select('id,product_id,type,qty_change,balance_after,unit_price,supplier,note,date,created_at,products(name,brand,spec,unit)')
+    .order('date', { ascending: false })
+    .order('id', { ascending: false })
+    .limit(Math.min(Number(req.query.limit) || 100, 1000));
+  if (req.query.product_id) q = q.eq('product_id', Number(req.query.product_id));
+  if (['received', 'sold', 'adjustment'].includes(req.query.type)) q = q.eq('type', req.query.type);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(req.query.from || '')) q = q.gte('date', req.query.from);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(req.query.to || '')) q = q.lte('date', req.query.to);
+  const rows = await unwrap(q);
+  res.json(rows.map(({ products, ...m }) => ({ ...m, name: products?.name, brand: products?.brand, spec: products?.spec, unit: products?.unit })));
 });
 
 // ---- backup / export
 admin.get('/export/json', async (req, res) => {
   res.set('Content-Disposition', `attachment; filename="gurukrupa-backup-${V.today()}.json"`);
   res.json({
-    exported_at: new Date().toISOString(),
-    categories: await D.all('SELECT * FROM categories ORDER BY id'),
-    subcategories: await D.all('SELECT * FROM subcategories ORDER BY id'),
-    products: await D.all('SELECT * FROM products ORDER BY id'),
-    stock_movements: await D.all('SELECT * FROM stock_movements ORDER BY id'),
+    exported_at: now(),
+    categories: await fetchAll(() => sb.from('categories').select('*').order('id')),
+    subcategories: await fetchAll(() => sb.from('subcategories').select('*').order('id')),
+    products: await fetchAll(() => sb.from('products').select('*').order('id')),
+    stock_movements: await fetchAll(() => sb.from('stock_movements').select('*').order('id')),
   });
 });
 
@@ -317,11 +293,16 @@ const csvCell = (v) => {
   return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
 };
 admin.get('/export/csv', async (req, res) => {
-  const rows = await D.all(
-    `SELECT p.code, p.name, p.brand, p.model, p.spec, c.name AS category, s.name AS subcategory, p.unit, p.cost_price, p.sell_price,
-      p.stock, p.min_stock, p.target_stock, p.reorder_qty, p.supplier, p.last_purchase_price, p.active, p.notes
-     FROM products p LEFT JOIN categories c ON c.id=p.category_id LEFT JOIN subcategories s ON s.id=p.subcategory_id ORDER BY c.sort, s.sort, p.name`
-  );
+  const [cats, subs, prods] = await Promise.all([
+    fetchAll(() => sb.from('categories').select('*').order('id')),
+    fetchAll(() => sb.from('subcategories').select('*').order('id')),
+    fetchAll(() => sb.from('products').select('*').order('id')),
+  ]);
+  const cat = new Map(cats.map((c) => [c.id, c]));
+  const sub = new Map(subs.map((s) => [s.id, s]));
+  const rows = prods
+    .map((p) => ({ ...p, category: cat.get(p.category_id)?.name, subcategory: sub.get(p.subcategory_id)?.name, _c: cat.get(p.category_id)?.sort ?? 999, _s: sub.get(p.subcategory_id)?.sort ?? 999 }))
+    .sort((a, b) => a._c - b._c || a._s - b._s || byName(a, b));
   const cols = ['code', 'name', 'brand', 'model', 'spec', 'category', 'subcategory', 'unit', 'cost_price', 'sell_price', 'stock', 'min_stock', 'target_stock', 'reorder_qty', 'supplier', 'last_purchase_price', 'active', 'notes'];
   const csv = '﻿' + [cols.join(','), ...rows.map((r) => cols.map((c) => csvCell(r[c])).join(','))].join('\r\n');
   res.set({ 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': `attachment; filename="gurukrupa-products-${V.today()}.csv"` });

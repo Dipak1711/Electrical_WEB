@@ -51,14 +51,13 @@ const port = Number(process.env.PORT) || 3000;
 (async () => {
   try {
     await init();
-    await storage.ensureBucket();
   } catch (e) {
-    console.error('Could not connect to Supabase:', e.message);
+    console.error('Could not start:', e.message);
     process.exit(1);
   }
   app.listen(port, () => {
     console.log(`Gurukrupa Electrical running on http://localhost:${port}`);
-    if (!storage.enabled) console.log('NOTE: photo uploads are off (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY not set).');
+    if (!storage.enabled) console.log('NOTE: photo uploads are off (SUPABASE_URL / SUPABASE_ANON_KEY not set).');
     if (auth.usingDemoPassword) console.log('NOTE: using the DEMO admin password. Set ADMIN_PASSWORD before going public.');
   });
 })();

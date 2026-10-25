@@ -29,19 +29,42 @@ async function call(method, url, body, { auth = true } = {}) {
   return { status: res.status, json, text, headers: res.headers };
 }
 
+const REST_PORT = 56000 + Math.floor(Math.random() * 900);
+const crypto = require('node:crypto');
+const b64 = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
+const JWT_SECRET = 'test-secret-test-secret-test-secret-1234';
+const sign = (payload) => { const d = `${b64({ alg: 'HS256', typ: 'JWT' })}.${b64(payload)}`; return d + '.' + crypto.createHmac('sha256', JWT_SECRET).update(d).digest('base64url'); };
+const ANON = sign({ role: 'anon', iss: 'supabase', exp: 4102444800 });
+
 before(async () => {
-  // throwaway local Postgres (same engine as Supabase) + a fake Supabase Storage endpoint
+  // Throwaway local Postgres + PostgREST (the same pair Supabase runs) + a small gateway that also fakes Supabase Storage.
   const bin = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/lib/postgresql/16/bin'].find((d) => fs.existsSync(d + '/initdb'));
   if (!bin) throw new Error('Postgres (initdb) not found - install it to run the tests');
+  const env = { ...process.env, LC_ALL: 'C', LANG: 'C' };
   const pgdir = path.join(dir, 'pg');
-  execFileSync(bin + '/initdb', ['-D', pgdir, '-U', 'postgres', '--auth=trust', '-E', 'UTF8', '--locale=C'], { stdio: 'ignore', env: { ...process.env, LC_ALL: 'C', LANG: 'C' } });
-  execFileSync(bin + '/pg_ctl', ['-D', pgdir, '-o', `-p ${PGPORT} -c unix_socket_directories= -c listen_addresses=127.0.0.1`, '-w', '-l', path.join(dir, 'pg.log'), 'start'], { stdio: 'ignore', env: { ...process.env, LC_ALL: 'C', LANG: 'C' } });
+  execFileSync(bin + '/initdb', ['-D', pgdir, '-U', 'postgres', '--auth=trust', '-E', 'UTF8', '--locale=C'], { stdio: 'ignore', env });
+  execFileSync(bin + '/pg_ctl', ['-D', pgdir, '-o', `-p ${PGPORT} -c unix_socket_directories= -c listen_addresses=127.0.0.1`, '-w', '-l', path.join(dir, 'pg.log'), 'start'], { stdio: 'ignore', env });
   after.pgStop = () => execFileSync(bin + '/pg_ctl', ['-D', pgdir, '-m', 'immediate', 'stop'], { stdio: 'ignore' });
+  const psql = (args) => execFileSync(bin + '/psql', ['-h', '127.0.0.1', '-p', String(PGPORT), '-U', 'postgres', '-v', 'ON_ERROR_STOP=1', ...args], { stdio: 'ignore' });
+  psql(['-c', 'CREATE ROLE anon NOLOGIN; CREATE ROLE authenticator LOGIN NOINHERIT; GRANT anon TO authenticator;']);
+  psql(['-f', path.join(__dirname, '..', 'supabase', 'schema.sql')]);
+
+  const conf = path.join(dir, 'postgrest.conf');
+  fs.writeFileSync(conf, `db-uri = "postgres://authenticator@127.0.0.1:${PGPORT}/postgres"\ndb-schemas = "public"\ndb-anon-role = "anon"\njwt-secret = "${JWT_SECRET}"\nserver-host = "127.0.0.1"\nserver-port = ${REST_PORT}\n`);
+  after.rest = spawn('postgrest', [conf], { stdio: 'ignore' });
 
   storeServer = http.createServer((req, res) => {
+    if (req.url.startsWith('/rest/v1/')) {
+      const pr = http.request({ host: '127.0.0.1', port: REST_PORT, path: req.url.slice(8), method: req.method, headers: req.headers }, (r) => {
+        res.writeHead(r.statusCode, r.headers);
+        r.pipe(res);
+      });
+      pr.on('error', () => { res.statusCode = 502; res.end(); });
+      return req.pipe(pr);
+    }
     const m = /^\/storage\/v1\/object\/product-images\/(.+)$/.exec(req.url);
     let body = '';
-    req.on('data', (d) => (body += d.length > 0 && req.method === 'DELETE' ? d : ''));
+    req.on('data', (d) => (body += req.method === 'DELETE' ? d : ''));
     req.on('end', () => {
       if (m && req.method === 'POST') stored.add(m[1]);
       if (req.method === 'DELETE') try { JSON.parse(body).prefixes.forEach((f) => stored.delete(f)); } catch {}
@@ -52,16 +75,18 @@ before(async () => {
   await new Promise((r) => storeServer.listen(STORE_PORT, '127.0.0.1', r));
 
   server = spawn(process.execPath, [path.join(__dirname, '..', 'server', 'index.js')], {
-    env: { ...process.env, PORT, ADMIN_PASSWORD: 'test-pass-1', DATABASE_URL: `postgres://postgres@127.0.0.1:${PGPORT}/postgres`, SUPABASE_URL: `http://127.0.0.1:${STORE_PORT}`, SUPABASE_SERVICE_ROLE_KEY: 'test-key' },
+    env: { ...process.env, PORT, ADMIN_PASSWORD: 'test-pass-1', SUPABASE_URL: `http://127.0.0.1:${STORE_PORT}`, SUPABASE_ANON_KEY: ANON },
     stdio: 'ignore',
   });
-  for (let i = 0; i < 80; i++) {
-    try { await fetch(BASE + '/api/catalog'); return; } catch { await new Promise((r) => setTimeout(r, 150)); }
+  for (let i = 0; i < 100; i++) {
+    try { if ((await fetch(BASE + '/api/catalog')).ok) return; } catch {}
+    await new Promise((r) => setTimeout(r, 150));
   }
   throw new Error('server did not start');
 });
 after(() => {
   server?.kill();
+  after.rest?.kill();
   storeServer?.close();
   try { after.pgStop?.(); } catch {}
   fs.rmSync(dir, { recursive: true, force: true });
@@ -147,6 +172,15 @@ test('sales: need stock set, cannot oversell, deduct stock and log history', asy
   assert.equal(mv.find((m) => m.type === 'sold').unit_price, 55); // defaults to the selling price
 });
 
+test('two sales at the same moment cannot both take the last item', async () => {
+  const mk = await call('POST', '/api/admin/products', { name: 'Race Item', category_id: catId, unit: 'Nos', sell_price: 5, stock: 1 });
+  assert.equal(mk.status, 201);
+  const results = await Promise.all([1, 2, 3, 4].map(() => call('POST', '/api/admin/sales', { product_id: mk.json.id, qty: 1 })));
+  assert.deepEqual(results.map((r) => r.status).sort(), [201, 409, 409, 409]);
+  const p = (await call('GET', '/api/admin/catalog')).json.products.find((x) => x.id === mk.json.id);
+  assert.equal(p.stock, 0);
+});
+
 test('browsing the customer catalogue does not change stock', async () => {
   for (let i = 0; i < 3; i++) await call('GET', '/api/catalog', null, { auth: false });
   const pub = (await call('GET', '/api/catalog', null, { auth: false })).json.products.find((p) => p.id === prodId);
@@ -190,7 +224,7 @@ test('categories in use cannot be deleted; exports work', async () => {
   const csv = await call('GET', '/api/admin/export/csv');
   assert.match(csv.text, /LED Bulb 9W/);
   const json = await call('GET', '/api/admin/export/json');
-  assert.equal(json.json.products.length, 2);
+  assert.ok(json.json.products.length >= 2);
   assert.equal((await call('GET', '/api/admin/export/csv', null, { auth: false })).status, 401);
 });
 

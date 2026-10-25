@@ -1,123 +1,57 @@
-// Postgres (Supabase). The connection string comes from DATABASE_URL.
-const { Pool, types } = require('pg');
+// Supabase, reached through its normal REST API with just SUPABASE_URL + SUPABASE_ANON_KEY (server side only).
+const { createClient } = require('@supabase/supabase-js');
 
-types.setTypeParser(20, (v) => parseInt(v, 10)); // COUNT(*) etc. arrive as numbers
-
-const url = process.env.DATABASE_URL;
-if (!url) {
-  console.error('DATABASE_URL is not set. Copy .env.example to .env and fill in your Supabase details.');
+const URL = process.env.SUPABASE_URL;
+const KEY = process.env.SUPABASE_ANON_KEY;
+if (!URL || !KEY) {
+  console.error('SUPABASE_URL and SUPABASE_ANON_KEY are not set. Copy .env.example to .env and fill them in.');
   process.exit(1);
 }
-const isLocal = /@(localhost|127\.0\.0\.1|\[::1\])[:/]/.test(url);
-const pool = new Pool({ connectionString: url, ssl: isLocal ? false : { rejectUnauthorized: false }, max: 5 });
-pool.on('error', (e) => console.error('Database connection error:', e.message));
+const sb = createClient(URL, KEY, { auth: { persistSession: false, autoRefreshToken: false } });
 
-// "?" placeholders are written in the SQL and turned into $1, $2... here
-const toPg = (sql) => {
-  let i = 0;
-  return sql.replace(/\?/g, () => '$' + ++i);
-};
-const api = (client) => ({
-  all: async (sql, ...args) => (await client.query(toPg(sql), args)).rows,
-  get: async (sql, ...args) => (await client.query(toPg(sql), args)).rows[0],
-  run: async (sql, ...args) => {
-    const r = await client.query(toPg(sql), args);
-    return { changes: r.rowCount, rows: r.rows };
-  },
-});
-const D = api(pool);
-
-// Runs fn(d) in one transaction; d has the same all/get/run helpers bound to that transaction.
-async function tx(fn) {
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const out = await fn(api(client));
-    await client.query('COMMIT');
-    return out;
-  } catch (e) {
-    await client.query('ROLLBACK').catch(() => {});
+// Throws a readable error (with the Postgres error code on .pg) instead of returning { error }
+async function unwrap(query) {
+  const { data, error, count } = await query;
+  if (error) {
+    const e = new Error(error.message || 'Database error');
+    e.pg = error.code;
     throw e;
-  } finally {
-    client.release();
+  }
+  return count != null && data == null ? count : data;
+}
+const countOf = async (query) => {
+  const { count, error } = await query;
+  if (error) throw new Error(error.message);
+  return count || 0;
+};
+
+// Supabase returns at most 1000 rows per request, so read big tables page by page.
+async function fetchAll(build) {
+  const out = [];
+  for (let from = 0; ; from += 1000) {
+    const rows = await unwrap(build().range(from, from + 999));
+    out.push(...rows);
+    if (rows.length < 1000) return out;
   }
 }
 
-async function nextCode(d = D) {
-  const row = await d.get("SELECT code FROM products WHERE code ~ '^GK-[0-9]+$' ORDER BY substr(code, 4)::int DESC LIMIT 1");
-  const n = row ? parseInt(row.code.slice(3), 10) + 1 : 1;
+const isUniqueViolation = (e) => e && e.pg === '23505';
+
+async function nextCode() {
+  const rows = await unwrap(sb.from('products').select('code').like('code', 'GK-%').order('code', { ascending: false }).limit(1));
+  const n = rows.length ? parseInt(rows[0].code.slice(3), 10) + 1 : 1;
   return 'GK-' + String(n).padStart(4, '0');
 }
 
-const TABLES = ['categories', 'subcategories', 'products', 'stock_movements'];
-
+// Called at startup: tells the owner clearly if the tables have not been created yet.
 async function init() {
-  await pool.query(`
-CREATE TABLE IF NOT EXISTS categories (
-  id SERIAL PRIMARY KEY,
-  name TEXT NOT NULL,
-  icon TEXT NOT NULL DEFAULT 'box',
-  sort INTEGER NOT NULL DEFAULT 0
-);
-CREATE UNIQUE INDEX IF NOT EXISTS categories_name_uq ON categories (lower(name));
-CREATE TABLE IF NOT EXISTS subcategories (
-  id SERIAL PRIMARY KEY,
-  category_id INTEGER NOT NULL REFERENCES categories(id),
-  name TEXT NOT NULL,
-  sort INTEGER NOT NULL DEFAULT 0
-);
-CREATE UNIQUE INDEX IF NOT EXISTS subcategories_name_uq ON subcategories (category_id, lower(name));
-CREATE TABLE IF NOT EXISTS products (
-  id SERIAL PRIMARY KEY,
-  code TEXT,                                -- our own code, e.g. GK-0001
-  name TEXT NOT NULL,
-  brand TEXT NOT NULL DEFAULT '',
-  model TEXT NOT NULL DEFAULT '',
-  spec TEXT NOT NULL DEFAULT '',
-  category_id INTEGER REFERENCES categories(id),
-  subcategory_id INTEGER REFERENCES subcategories(id),
-  unit TEXT NOT NULL DEFAULT 'Nos',
-  cost_price DOUBLE PRECISION,              -- private
-  sell_price DOUBLE PRECISION,
-  stock DOUBLE PRECISION,                   -- NULL = not set
-  min_stock DOUBLE PRECISION,
-  target_stock DOUBLE PRECISION,
-  reorder_qty DOUBLE PRECISION,
-  supplier TEXT NOT NULL DEFAULT '',
-  last_purchase_price DOUBLE PRECISION,
-  image TEXT,                               -- file name inside the Supabase Storage bucket
-  keywords TEXT NOT NULL DEFAULT '',
-  notes TEXT NOT NULL DEFAULT '',
-  active INTEGER NOT NULL DEFAULT 1,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-CREATE UNIQUE INDEX IF NOT EXISTS products_code_uq ON products (lower(code)) WHERE code IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_products_cat ON products (category_id, subcategory_id);
-CREATE TABLE IF NOT EXISTS stock_movements (
-  id SERIAL PRIMARY KEY,
-  product_id INTEGER NOT NULL REFERENCES products(id),
-  type TEXT NOT NULL CHECK (type IN ('received','sold','adjustment')),
-  qty_change DOUBLE PRECISION NOT NULL,
-  balance_after DOUBLE PRECISION NOT NULL,
-  unit_price DOUBLE PRECISION,
-  supplier TEXT NOT NULL DEFAULT '',
-  note TEXT NOT NULL DEFAULT '',
-  date TEXT NOT NULL,                       -- YYYY-MM-DD
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS idx_mov_product ON stock_movements (product_id, id);
-CREATE INDEX IF NOT EXISTS idx_mov_date ON stock_movements (date, id);
-`);
-  // Supabase exposes tables to the public "anon" key through its own API. Row level security with no policies
-  // means that key can read nothing, so purchase prices stay private. This server connects as the owner and is not affected.
-  for (const t of TABLES) await pool.query(`ALTER TABLE ${t} ENABLE ROW LEVEL SECURITY`);
-  await pool.query(`DO $$ BEGIN
-    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
-      EXECUTE 'REVOKE ALL ON ${TABLES.join(', ')} FROM anon, authenticated';
-    END IF; END $$;`);
+  const { error } = await sb.from('products').select('id').limit(1);
+  if (error) {
+    if (/relation|does not exist|schema cache|Could not find/i.test(error.message)) {
+      throw new Error('The tables are not created yet. Open Supabase > SQL Editor and run the file supabase/schema.sql.');
+    }
+    throw new Error(error.message);
+  }
 }
 
-const isUniqueViolation = (e) => e && e.code === '23505';
-
-module.exports = { pool, D, tx, nextCode, init, isUniqueViolation, TABLES };
+module.exports = { sb, unwrap, countOf, fetchAll, nextCode, init, isUniqueViolation };

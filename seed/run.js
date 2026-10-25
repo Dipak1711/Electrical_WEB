@@ -36,39 +36,37 @@ if (process.argv.includes('--report')) {
   process.exit(0);
 }
 
-const { D, tx, nextCode, init, pool } = require('../server/db');
+const { sb, unwrap, countOf, init } = require('../server/db');
+
+const chunks = (arr, n = 100) => Array.from({ length: Math.ceil(arr.length / n) }, (_, i) => arr.slice(i * n, i * n + n));
 
 (async () => {
   await init();
-  const existing = (await D.get('SELECT COUNT(*) AS n FROM products')).n;
+  const existing = await countOf(sb.from('products').select('id', { count: 'exact', head: true }));
   if (existing > 0) {
     console.log(`Database already has ${existing} products - nothing imported (existing data is never overwritten).`);
     return;
   }
-  await tx(async (t) => {
-    const catIds = new Map();
-    const subIds = new Map();
-    for (const [ci, c] of taxonomy.entries()) {
-      const cat = await t.get('INSERT INTO categories (name, icon, sort) VALUES (?,?,?) RETURNING id', c.name, c.icon, ci);
-      catIds.set(c.name, cat.id);
-      for (const [si, s] of c.subs.entries()) {
-        const sub = await t.get('INSERT INTO subcategories (category_id, name, sort) VALUES (?,?,?) RETURNING id', cat.id, s, si);
-        subIds.set(c.name + '|' + s, sub.id);
-      }
+  const catIds = new Map();
+  const subIds = new Map();
+  for (const [ci, c] of taxonomy.entries()) {
+    const cat = await unwrap(sb.from('categories').insert({ name: c.name, icon: c.icon, sort: ci }).select('id').single());
+    catIds.set(c.name, cat.id);
+    for (const [si, s] of c.subs.entries()) {
+      const sub = await unwrap(sb.from('subcategories').insert({ category_id: cat.id, name: s, sort: si }).select('id').single());
+      subIds.set(c.name + '|' + s, sub.id);
     }
-    for (const i of items) {
-      await t.run(
-        `INSERT INTO products (code, name, brand, spec, category_id, subcategory_id, unit, cost_price, sell_price, notes) VALUES (?,?,?,?,?,?,?,?,?,?)`,
-        await nextCode(t), i.name, i.brand, i.spec, catIds.get(i.category), subIds.get(i.category + '|' + i.subcategory), i.unit, i.cost_price, i.sell_price, i.notes
-      );
-    }
-  });
+  }
+  const rows = items.map((i, n) => ({
+    code: 'GK-' + String(n + 1).padStart(4, '0'), name: i.name, brand: i.brand, spec: i.spec,
+    category_id: catIds.get(i.category), subcategory_id: subIds.get(i.category + '|' + i.subcategory),
+    unit: i.unit, cost_price: i.cost_price, sell_price: i.sell_price, notes: i.notes,
+  }));
+  for (const part of chunks(rows)) await unwrap(sb.from('products').insert(part));
   const text = report();
   fs.writeFileSync(path.join(__dirname, '..', 'IMPORT_REPORT.txt'), text + '\n');
   console.log('Import complete.\n' + text);
-})()
-  .catch((e) => {
-    console.error('Import failed:', e.message);
-    process.exitCode = 1;
-  })
-  .finally(() => pool.end());
+})().catch((e) => {
+  console.error('Import failed:', e.message);
+  process.exitCode = 1;
+});
