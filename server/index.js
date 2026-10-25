@@ -4,7 +4,8 @@ const compression = require('compression');
 const auth = require('./auth');
 const { publicRouter, adminRouter } = require('./routes');
 const { HttpError } = require('./validate');
-const { DATA_DIR } = require('./db');
+const { init } = require('./db');
+const storage = require('./storage');
 
 if (process.env.NODE_ENV === 'production' && auth.usingDemoPassword) {
   console.error('Refusing to start: set ADMIN_PASSWORD to something private before running in production (the demo password is public).');
@@ -35,7 +36,6 @@ app.use('/api', publicRouter);
 app.use('/api/admin', adminRouter);
 app.use('/api', (req, res) => res.status(404).json({ error: 'Not found.' }));
 
-app.use('/uploads', express.static(path.join(DATA_DIR, 'uploads'), { maxAge: '365d', immutable: true }));
 app.use('/vendor', express.static(path.join(__dirname, '..', 'public', 'vendor'), { maxAge: '7d' }));
 app.use(express.static(path.join(__dirname, '..', 'public'), { extensions: ['html'], maxAge: 0 }));
 
@@ -48,7 +48,17 @@ app.use((err, req, res, next) => {
 });
 
 const port = Number(process.env.PORT) || 3000;
-app.listen(port, () => {
-  console.log(`Gurukrupa Electrical running on http://localhost:${port}`);
-  if (auth.usingDemoPassword) console.log('NOTE: using the DEMO admin password. Set ADMIN_PASSWORD before going public.');
-});
+(async () => {
+  try {
+    await init();
+    await storage.ensureBucket();
+  } catch (e) {
+    console.error('Could not connect to Supabase:', e.message);
+    process.exit(1);
+  }
+  app.listen(port, () => {
+    console.log(`Gurukrupa Electrical running on http://localhost:${port}`);
+    if (!storage.enabled) console.log('NOTE: photo uploads are off (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY not set).');
+    if (auth.usingDemoPassword) console.log('NOTE: using the DEMO admin password. Set ADMIN_PASSWORD before going public.');
+  });
+})();

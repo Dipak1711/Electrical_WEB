@@ -5,11 +5,17 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
+const http = require('node:http');
+const { execFileSync } = require('node:child_process');
+
 const PORT = 3900 + Math.floor(Math.random() * 90);
+const PGPORT = 54000 + Math.floor(Math.random() * 900);
+const STORE_PORT = 55000 + Math.floor(Math.random() * 900);
 const BASE = `http://127.0.0.1:${PORT}`;
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gk-test-'));
-let server;
+let server, storeServer;
 let cookie = '';
+const stored = new Set(); // file names the fake Supabase Storage currently holds
 
 async function call(method, url, body, { auth = true } = {}) {
   const res = await fetch(BASE + url, {
@@ -24,16 +30,42 @@ async function call(method, url, body, { auth = true } = {}) {
 }
 
 before(async () => {
+  // throwaway local Postgres (same engine as Supabase) + a fake Supabase Storage endpoint
+  const bin = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/lib/postgresql/16/bin'].find((d) => fs.existsSync(d + '/initdb'));
+  if (!bin) throw new Error('Postgres (initdb) not found - install it to run the tests');
+  const pgdir = path.join(dir, 'pg');
+  execFileSync(bin + '/initdb', ['-D', pgdir, '-U', 'postgres', '--auth=trust', '-E', 'UTF8', '--locale=C'], { stdio: 'ignore', env: { ...process.env, LC_ALL: 'C', LANG: 'C' } });
+  execFileSync(bin + '/pg_ctl', ['-D', pgdir, '-o', `-p ${PGPORT} -c unix_socket_directories= -c listen_addresses=127.0.0.1`, '-w', '-l', path.join(dir, 'pg.log'), 'start'], { stdio: 'ignore', env: { ...process.env, LC_ALL: 'C', LANG: 'C' } });
+  after.pgStop = () => execFileSync(bin + '/pg_ctl', ['-D', pgdir, '-m', 'immediate', 'stop'], { stdio: 'ignore' });
+
+  storeServer = http.createServer((req, res) => {
+    const m = /^\/storage\/v1\/object\/product-images\/(.+)$/.exec(req.url);
+    let body = '';
+    req.on('data', (d) => (body += d.length > 0 && req.method === 'DELETE' ? d : ''));
+    req.on('end', () => {
+      if (m && req.method === 'POST') stored.add(m[1]);
+      if (req.method === 'DELETE') try { JSON.parse(body).prefixes.forEach((f) => stored.delete(f)); } catch {}
+      res.setHeader('Content-Type', 'application/json');
+      res.end('{}');
+    });
+  });
+  await new Promise((r) => storeServer.listen(STORE_PORT, '127.0.0.1', r));
+
   server = spawn(process.execPath, [path.join(__dirname, '..', 'server', 'index.js')], {
-    env: { ...process.env, PORT, DATA_DIR: dir, ADMIN_PASSWORD: 'test-pass-1' },
+    env: { ...process.env, PORT, ADMIN_PASSWORD: 'test-pass-1', DATABASE_URL: `postgres://postgres@127.0.0.1:${PGPORT}/postgres`, SUPABASE_URL: `http://127.0.0.1:${STORE_PORT}`, SUPABASE_SERVICE_ROLE_KEY: 'test-key' },
     stdio: 'ignore',
   });
-  for (let i = 0; i < 50; i++) {
-    try { await fetch(BASE + '/api/catalog'); return; } catch { await new Promise((r) => setTimeout(r, 100)); }
+  for (let i = 0; i < 80; i++) {
+    try { await fetch(BASE + '/api/catalog'); return; } catch { await new Promise((r) => setTimeout(r, 150)); }
   }
   throw new Error('server did not start');
 });
-after(() => { server.kill(); fs.rmSync(dir, { recursive: true, force: true }); });
+after(() => {
+  server?.kill();
+  storeServer?.close();
+  try { after.pgStop?.(); } catch {}
+  fs.rmSync(dir, { recursive: true, force: true });
+});
 
 let catId, subId, prodId;
 
@@ -147,8 +179,10 @@ test('image upload accepts pictures only and can be removed', async () => {
   const up = await call('POST', `/api/admin/products/${prodId}/image`, { dataUrl: png });
   assert.equal(up.status, 200);
   assert.ok(up.json.image.endsWith('.png'));
-  assert.equal((await fetch(`${BASE}/uploads/${up.json.image}`)).status, 200);
+  assert.match(up.json.image, new RegExp(`^http://127\\.0\\.0\\.1:${STORE_PORT}/storage/v1/object/public/product-images/p${prodId}-`));
+  assert.equal(stored.size, 1); // the photo went to storage, not to local disk
   assert.equal((await call('DELETE', `/api/admin/products/${prodId}/image`)).json.image, null);
+  assert.equal(stored.size, 0);
 });
 
 test('categories in use cannot be deleted; exports work', async () => {

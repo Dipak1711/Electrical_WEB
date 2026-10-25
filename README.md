@@ -1,23 +1,21 @@
 # Gurukrupa Electrical & Services - catalogue, pricing & stock
 
-## Run it
-```
-npm install
-npm run seed     # first time only: imports the starting catalogue (never overwrites existing data)
-npm run dev     # same as start, but restarts when you edit code
-npm start        # http://localhost:3000   (admin: tap the person icon, top right)
-npm test         # API tests (uses a temporary database)
-```
-Open it on your phone using your computer's IP, e.g. `http://192.168.x.x:3000` (same Wi-Fi).
+Data (products, prices, stock, sales) is stored in **Supabase** (Postgres). Product photos go to Supabase Storage.
 
-## Admin password
-Demo password: `87654321`. The check happens on the server; the admin data is only sent after login.
-Before putting the site online, start it with your own password - the server refuses to start in production with the demo one:
-```
-NODE_ENV=production ADMIN_PASSWORD='your-private-password' npm start
-```
-Serve it over HTTPS when public (the login cookie is then marked Secure automatically).
+## Set up (once)
+1. Supabase > SQL Editor > paste `supabase/schema.sql` > Run.
+2. Copy `.env.example` to `.env` and fill in `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` and `DATABASE_URL`.
+3. `npm install`
+4. Load the data, either
+   - `npm run migrate` - copies your existing local data (`data/gurukrupa.db`) to Supabase, or
+   - `npm run seed` - imports the starting catalogue into an empty database.
+5. `npm run dev` (or `npm start`) -> http://localhost:3000
 
-## Data
-- Database: `data/gurukrupa.db` (SQLite). Product photos: `data/uploads/`. Back both up, or use Admin > More > Backup.
-- `seed/data.js` is the starting catalogue transcribed from your price sheet; `IMPORT_REPORT.txt` lists what needs checking.
+## Security
+- The server connects with the database login; the website never sees any Supabase key.
+- Row level security is ON with no policies, so Supabase's public anon key can read nothing (purchase prices stay private).
+- Never put the service_role key in website code or share it.
+- Admin demo password `87654321`; set `ADMIN_PASSWORD` before going public (the server refuses to start in production with the demo one).
+
+## Other
+`npm test` runs the API tests against a temporary local Postgres (needs Postgres installed). Backups: Admin > More > Backup.

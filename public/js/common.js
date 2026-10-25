@@ -102,7 +102,7 @@ export function productType(p) {
   return null;
 }
 export function thumb(p) {
-  if (p.image) return `<img src="/uploads/${esc(p.image)}" alt="${esc(p.name)}" loading="lazy" decoding="async">`;
+  if (p.image) return `<img src="${esc(p.image)}" alt="${esc(p.name)}" loading="lazy" decoding="async">`;
   const t = productType(p);
   return t ? `<img class="illus" src="/img/types/${t}.svg" alt="${esc(p.name)} (illustration)" loading="lazy" decoding="async" title="Illustration - not a photo of this exact item">` : '';
 }

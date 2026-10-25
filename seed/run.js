@@ -36,31 +36,39 @@ if (process.argv.includes('--report')) {
   process.exit(0);
 }
 
-const { db, tx, nextCode } = require('../server/db');
-const existing = db.prepare('SELECT COUNT(*) AS n FROM products').get().n;
-if (existing > 0) {
-  console.log(`Database already has ${existing} products - nothing imported (existing data is never overwritten).`);
-  process.exit(0);
-}
+const { D, tx, nextCode, init, pool } = require('../server/db');
 
-tx(() => {
-  const catIds = new Map();
-  const subIds = new Map();
-  taxonomy.forEach((c, ci) => {
-    const { lastInsertRowid } = db.prepare('INSERT INTO categories (name, icon, sort) VALUES (?,?,?)').run(c.name, c.icon, ci);
-    catIds.set(c.name, Number(lastInsertRowid));
-    c.subs.forEach((s, si) => {
-      const r = db.prepare('INSERT INTO subcategories (category_id, name, sort) VALUES (?,?,?)').run(Number(lastInsertRowid), s, si);
-      subIds.set(c.name + '|' + s, Number(r.lastInsertRowid));
-    });
-  });
-  const ins = db.prepare(`INSERT INTO products (code, name, brand, spec, category_id, subcategory_id, unit, cost_price, sell_price, notes, last_purchase_price)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?)`);
-  for (const i of items) {
-    ins.run(nextCode(), i.name, i.brand, i.spec, catIds.get(i.category), subIds.get(i.category + '|' + i.subcategory), i.unit, i.cost_price, i.sell_price, i.notes, null);
+(async () => {
+  await init();
+  const existing = (await D.get('SELECT COUNT(*) AS n FROM products')).n;
+  if (existing > 0) {
+    console.log(`Database already has ${existing} products - nothing imported (existing data is never overwritten).`);
+    return;
   }
-});
-
-const text = report();
-fs.writeFileSync(path.join(__dirname, '..', 'IMPORT_REPORT.txt'), text + '\n');
-console.log('Import complete.\n' + text);
+  await tx(async (t) => {
+    const catIds = new Map();
+    const subIds = new Map();
+    for (const [ci, c] of taxonomy.entries()) {
+      const cat = await t.get('INSERT INTO categories (name, icon, sort) VALUES (?,?,?) RETURNING id', c.name, c.icon, ci);
+      catIds.set(c.name, cat.id);
+      for (const [si, s] of c.subs.entries()) {
+        const sub = await t.get('INSERT INTO subcategories (category_id, name, sort) VALUES (?,?,?) RETURNING id', cat.id, s, si);
+        subIds.set(c.name + '|' + s, sub.id);
+      }
+    }
+    for (const i of items) {
+      await t.run(
+        `INSERT INTO products (code, name, brand, spec, category_id, subcategory_id, unit, cost_price, sell_price, notes) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+        await nextCode(t), i.name, i.brand, i.spec, catIds.get(i.category), subIds.get(i.category + '|' + i.subcategory), i.unit, i.cost_price, i.sell_price, i.notes
+      );
+    }
+  });
+  const text = report();
+  fs.writeFileSync(path.join(__dirname, '..', 'IMPORT_REPORT.txt'), text + '\n');
+  console.log('Import complete.\n' + text);
+})()
+  .catch((e) => {
+    console.error('Import failed:', e.message);
+    process.exitCode = 1;
+  })
+  .finally(() => pool.end());

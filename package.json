@@ -4,9 +4,10 @@
   "description": "Gurukrupa Electrical & Services - catalogue, pricing and stock",
   "main": "server/index.js",
   "scripts": {
-    "start": "node server/index.js",
-    "dev": "node --watch server/index.js",
-    "seed": "node seed/run.js",
+    "start": "node --env-file-if-exists=.env server/index.js",
+    "dev": "node --watch --env-file-if-exists=.env server/index.js",
+    "seed": "node --env-file-if-exists=.env seed/run.js",
+    "migrate": "node --env-file=.env seed/migrate-sqlite.js",
     "test": "node --test test/*.test.js"
   },
   "type": "commonjs",
@@ -14,7 +15,8 @@
     "compression": "^1.8.2",
     "express": "^5.3.0",
     "jspdf": "^4.2.1",
-    "jspdf-autotable": "^5.0.9"
+    "jspdf-autotable": "^5.0.9",
+    "pg": "^8.23.1"
   },
   "private": true,
   "engines": {

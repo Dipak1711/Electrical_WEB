@@ -120,7 +120,7 @@ export function openProductForm(p) {
   const refreshPic = () => {
     const pic = $('#pfpic', el);
     if (pendingImage) pic.innerHTML = `<img src="${pendingImage}" alt="">`;
-    else if (d.image && !removeImage) pic.innerHTML = `<img src="/uploads/${esc(d.image)}" alt="">`;
+    else if (d.image && !removeImage) pic.innerHTML = `<img src="${esc(d.image)}" alt="">`;
     else pic.innerHTML = thumb(d) || `<div class="ph">${icon('camera')}<span>No photo</span></div>`;
   };
   const refreshSubs = () => {
