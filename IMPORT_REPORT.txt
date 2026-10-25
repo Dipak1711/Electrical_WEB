@@ -1,0 +1,11 @@
+Products: 190
+Categories: 10, subcategories: 39
+Without purchase price: 67
+Without selling price: 163
+Stock quantity / minimum stock / supplier: not in the sheet, left unset for all
+Exact duplicates (same name+brand+spec): 0
+
+Entries to double-check:
+  - Pica Pipe 10 mm: Selling price (10) is below the purchase price per metre (10.80). Please confirm.
+  - C-Clamp (China Saddle) 20 mm: Retail quantity is 8 here but 10 on the other clamp sizes. Please confirm.
+  - Indicator: Selling price 450 is 10x the purchase price 45 - possibly meant to be 45. Please confirm.
