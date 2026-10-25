@@ -8,7 +8,7 @@ const stockState = { mode: 'reorder', list: 'low', histType: '', histDays: '7' }
 views.stock = {
   render(root) {
     root.innerHTML = `
-      <div class="toolbar"><button class="btn primary" id="recv">${icon('plus')} Receive stock</button><button class="btn" id="adj">Correct stock</button></div>
+      <div class="toolbar"><button class="btn primary" id="recv">${icon('plus')} Receive stock</button><button class="btn" id="adj">Set stock</button></div>
       <div class="seg" style="margin-bottom:12px"><button data-mode="reorder" class="${stockState.mode === 'reorder' ? 'on' : ''}">Reorder list</button>
         <button data-mode="history" class="${stockState.mode === 'history' ? 'on' : ''}">History</button></div>
       <div id="stockbody"></div>`;
@@ -36,8 +36,8 @@ function renderReorder(body) {
       <button data-list="unset" class="${stockState.list === 'unset' ? 'on' : ''}"><b>${unset.length}</b><span>Stock not set</span></button>
     </div>
     ${stockState.list === 'low'
-      ? `<p class="note">Alerts appear when stock is below the product's <b>minimum stock</b> (set it in Products → edit) or is zero. Suggested quantity = target stock − current stock. You can type your own quantity. Nothing is ordered automatically.</p>`
-      : stockState.list === 'unset' ? `<p class="note">These products have no stock count yet. Use <b>Correct stock</b> to enter what you have on the shelf.</p>` : ''}
+      ? `<p class="note">Items that are out or below their alert level. You decide what to order - nothing is ordered automatically.</p>`
+      : stockState.list === 'unset' ? `<p class="note">Tap a product, then <b>Set stock</b>, to enter how many you have.</p>` : ''}
     ${stockState.list === 'low' && low.length ? `<div class="toolbar"><button class="btn sm" id="copyList">Copy reorder list</button></div>` : ''}
     <div class="${stockState.list === 'low' ? 'reorder' : 'rows'}" id="slist"></div>`;
   const list = $('#slist');
@@ -152,9 +152,9 @@ actions.receive = (preset) => {
   preset ? show(preset) : pick();
 };
 
-// ---------------------------------------------------------------- Correct stock (manual adjustment)
+// ---------------------------------------------------------------- Set stock (manual adjustment)
 actions.adjust = (preset) => {
-  const { el, close } = openModal(`<div class="head"><h2>Correct stock</h2><button class="close" data-close aria-label="Close">${icon('close')}</button></div><div id="abody"></div>`);
+  const { el, close } = openModal(`<div class="head"><h2>Set stock</h2><button class="close" data-close aria-label="Close">${icon('close')}</button></div><div id="abody"></div>`);
   const show = (p) => {
     $('#abody', el).innerHTML = `<div class="panel" style="background:#f6f6f3"><b>${esc(p.name)}</b><div class="meta">${esc(productTitle(p))}</div>
         <div class="meta">System says: <b>${p.stock == null ? 'not set' : qtyText(p.stock) + ' ' + esc(p.unit)}</b></div>

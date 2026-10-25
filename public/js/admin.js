@@ -4,57 +4,14 @@ import './admin-products.js';
 import './admin-stock.js';
 
 const TABS = [
-  ['find', 'Find', 'search'],
   ['products', 'Products', 'box'],
   ['stock', 'Stock', 'stock'],
   ['sell', 'Sell', 'rupee'],
   ['more', 'More', 'dots'],
 ];
 
-// ---------------------------------------------------------------- Find (the main screen)
-const find = { q: '', shown: 40 };
-function renderFindList() {
-  const list = search(find.q, () => true);
-  const out = find.q.trim() ? list : list.filter((p) => p.active);
-  $('#fcount').textContent = find.q.trim() ? `${out.length} found` : `${out.length} products — start typing to search`;
-  $('#flist').innerHTML = out.slice(0, find.shown).map(prowHtml).join('') || '<div class="empty">Nothing found. Try fewer letters or another word.</div>';
-  $('#fmore').hidden = out.length <= find.shown;
-}
-views.find = {
-  render(root) {
-    root.innerHTML = `<div class="searchbar"><span>${icon('search')}</span>
-        <input id="fq" type="search" inputmode="search" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Name, brand, model, type…" value="${esc(find.q)}" autofocus>
-        <button class="clear" id="fclear" aria-label="Clear" ${find.q ? '' : 'hidden'}>${icon('close')}</button></div>
-      <div class="count" id="fcount"></div><div class="rows" id="flist"></div><button class="btn more" id="fmore" hidden>Show more</button>`;
-    renderFindList();
-    const q = $('#fq');
-    q.addEventListener('input', debounce(() => { find.q = q.value; find.shown = 40; $('#fclear').hidden = !q.value; renderFindList(); }, 40));
-    $('#fclear').onclick = () => { q.value = ''; find.q = ''; $('#fclear').hidden = true; renderFindList(); q.focus(); };
-    $('#fmore').onclick = () => { find.shown += 40; renderFindList(); };
-    $('#flist').onclick = (e) => {
-      const r = e.target.closest('[data-id]');
-      if (r) actions.quick(byId(Number(r.dataset.id)));
-    };
-  },
-};
-
-// Quick view: the numbers at a glance + shortcuts
-actions.quick = (p) => {
-  const cat = catOf(p.category_id);
-  const sub = subOf(p.subcategory_id);
-  const { el, close } = openModal(`<div class="head"><h2 style="font-size:18px">${esc(p.name)}</h2><button class="close" data-close aria-label="Close">${icon('close')}</button></div>
-    <div class="bigcard">${thumb(p) ? `<div class="pic">${thumb(p)}</div>` : ''}
-      <div class="meta">${esc(productTitle(p))}${p.active ? '' : ' · <b>Inactive</b>'}</div>${nums(p)}
-      <div class="meta">${esc([cat?.name, sub?.name].filter(Boolean).join(' › '))} · Code ${esc(p.code || '')}${p.supplier ? ' · Supplier: ' + esc(p.supplier) : ''}</div>
-      ${p.min_stock != null ? `<div class="meta">Minimum stock: ${p.min_stock}${p.target_stock != null ? ', target ' + p.target_stock : ''}</div>` : ''}
-      ${p.notes ? `<div class="meta">📝 ${esc(p.notes)}</div>` : ''}
-      <div class="actions two"><button class="btn primary" id="qsell" ${p.active ? '' : 'disabled'}>Record sale</button><button class="btn" id="qrecv">Receive stock</button>
-        <button class="btn" id="qedit">Edit product</button><button class="btn" id="qadj">Correct stock</button></div></div>`);
-  $('#qsell', el).onclick = () => { close(); actions.sell(p); };
-  $('#qrecv', el).onclick = () => { close(); actions.receive(p); };
-  $('#qedit', el).onclick = () => { close(); actions.edit(p); };
-  $('#qadj', el).onclick = () => { close(); actions.adjust(p); };
-};
+// tapping a product anywhere (stock lists, etc.) opens the same edit dialog
+actions.quick = (p) => actions.edit(p);
 
 // ---------------------------------------------------------------- More
 views.more = {
@@ -105,6 +62,6 @@ async function boot() {
     return;
   }
   updateBadge();
-  goto('find');
+  goto('products');
 }
 boot();

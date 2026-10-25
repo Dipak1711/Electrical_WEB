@@ -5,7 +5,7 @@ export const S = { categories: [], products: [], index: [], demoPassword: false 
 // screens register their openers here so they can call each other without circular imports
 export const actions = {};
 export const views = {}; // tab name -> { render(root), refresh?() }
-export let currentTab = 'find';
+export let currentTab = 'products';
 export const setCurrentTab = (t) => (currentTab = t);
 
 export async function load() {
@@ -66,6 +66,28 @@ export function prowHtml(p) {
     ${pic ? `<div class="pic">${pic}</div>` : ''}
     <div><div class="nm">${esc(p.name)} ${p.active ? '' : '<span class="pill gray">Inactive</span>'}</div>
       ${meta ? `<div class="meta">${esc(meta)}</div>` : ''}${nums(p)}</div></button>`;
+}
+
+// Product card in the same look as the customer site. Sell price is the big number; buy price and stock are small.
+export function adminCardHtml(p) {
+  const pic = thumb(p);
+  const meta = [p.model, p.spec].filter(Boolean).join(' · ');
+  let stock;
+  if (p.stock == null) stock = '<span class="stock unk">Stock not counted</span>';
+  else if (p.stock <= 0) stock = '<span class="stock out">Out of stock</span>';
+  else stock = `<span class="stock ${isLow(p) ? 'low' : 'ok'}">${isLow(p) ? 'Low: ' : ''}${qtyText(p.stock)} ${esc(p.unit)}</span>`;
+  return `<article class="card acard" data-id="${p.id}" tabindex="0" role="button" aria-label="Edit ${esc(p.name)}">
+    ${pic ? `<div class="img">${pic}</div>` : ''}
+    <div class="body">
+      <h3>${esc(p.name)} ${p.active ? '' : '<span class="pill gray">Inactive</span>'}</h3>
+      <div class="brand ${p.brand ? '' : 'none'}">${p.brand ? esc(p.brand) : 'Brand not listed'}</div>
+      ${meta ? `<div class="meta">${esc(meta)}</div>` : ''}
+      <div class="afoot">
+        ${p.sell_price != null ? `<div class="price">${money(p.sell_price)} <small>sell</small></div>` : '<div class="need">+ Add price</div>'}
+        <div class="buysm">Buy ${p.cost_price != null ? money(p.cost_price) : '—'}</div>
+      </div>
+      ${stock}
+    </div></article>`;
 }
 
 export function search(q, filter) {
