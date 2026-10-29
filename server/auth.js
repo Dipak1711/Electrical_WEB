@@ -8,7 +8,11 @@ const usingDemoPassword = PASSWORD === DEMO_PASSWORD;
 
 const COOKIE = 'gk_admin';
 const SESSION_MS = 12 * 60 * 60 * 1000;
-const sessions = new Map(); // token -> expiry. In memory: restarting the server logs the admin out.
+// Sessions are signed tokens (expiry + HMAC of the password), so they work across serverless instances.
+// Changing ADMIN_PASSWORD logs every admin out.
+function sign(exp) {
+  return crypto.createHmac('sha256', PASSWORD).update('gk-session:' + exp).digest('hex');
+}
 
 const attempts = new Map(); // ip -> { n, until }
 const MAX_FAILS = 5;
@@ -32,13 +36,9 @@ function readCookie(req, name) {
 function isAdmin(req) {
   const token = readCookie(req, COOKIE);
   if (!token) return false;
-  const exp = sessions.get(token);
-  if (!exp) return false;
-  if (exp < Date.now()) {
-    sessions.delete(token);
-    return false;
-  }
-  return true;
+  const [exp, mac] = token.split('.');
+  if (!exp || !mac || !/^\d+$/.test(exp) || Number(exp) < Date.now()) return false;
+  return safeEqual(mac, sign(exp));
 }
 
 function requireAdmin(req, res, next) {
@@ -59,16 +59,14 @@ function login(req, res) {
     return res.status(401).json({ error: 'Wrong password.' });
   }
   attempts.delete(ip);
-  const token = crypto.randomBytes(32).toString('hex');
-  sessions.set(token, Date.now() + SESSION_MS);
+  const exp = Date.now() + SESSION_MS;
+  const token = `${exp}.${sign(exp)}`;
   const secure = req.secure || req.headers['x-forwarded-proto'] === 'https';
   res.setHeader('Set-Cookie', `${COOKIE}=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${SESSION_MS / 1000}${secure ? '; Secure' : ''}`);
   res.json({ ok: true });
 }
 
 function logout(req, res) {
-  const token = readCookie(req, COOKIE);
-  if (token) sessions.delete(token);
   res.setHeader('Set-Cookie', `${COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0`);
   res.json({ ok: true });
 }

@@ -47,17 +47,23 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Something went wrong. Please try again.' });
 });
 
-const port = Number(process.env.PORT) || 3000;
-(async () => {
-  try {
-    await init();
-  } catch (e) {
+// Resolves once the tables are confirmed to exist (Vercel awaits this on each cold start).
+const ready = init();
+
+module.exports = app;
+module.exports.ready = ready;
+
+// Locally / on a normal host: start listening. On Vercel the exported app is used instead.
+if (require.main === module) {
+  const port = Number(process.env.PORT) || 3000;
+  ready.then(() => {
+    app.listen(port, () => {
+      console.log(`Gurukrupa Electrical running on http://localhost:${port}`);
+      if (!storage.enabled) console.log('NOTE: photo uploads are off (SUPABASE_URL / SUPABASE_ANON_KEY not set).');
+      if (auth.usingDemoPassword) console.log('NOTE: using the DEMO admin password. Set ADMIN_PASSWORD before going public.');
+    });
+  }, (e) => {
     console.error('Could not start:', e.message);
     process.exit(1);
-  }
-  app.listen(port, () => {
-    console.log(`Gurukrupa Electrical running on http://localhost:${port}`);
-    if (!storage.enabled) console.log('NOTE: photo uploads are off (SUPABASE_URL / SUPABASE_ANON_KEY not set).');
-    if (auth.usingDemoPassword) console.log('NOTE: using the DEMO admin password. Set ADMIN_PASSWORD before going public.');
   });
-})();
+}
