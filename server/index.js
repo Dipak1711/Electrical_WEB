@@ -49,6 +49,7 @@ app.use((err, req, res, next) => {
 
 // Resolves once the tables are confirmed to exist (Vercel awaits this on each cold start).
 const ready = init();
+ready.catch(() => {}); // handled by the caller below; stops Node crashing on an unhandled rejection
 
 module.exports = app;
 module.exports.ready = ready;
