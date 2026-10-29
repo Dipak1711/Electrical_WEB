@@ -71,11 +71,14 @@ async function cleanProduct(b, existing) {
     subcategory_id: b.subcategory_id ? Number(b.subcategory_id) : null,
   };
   if (p.target_stock != null && p.min_stock != null && p.target_stock < p.min_stock) throw bad('Target stock cannot be lower than minimum stock.');
-  if (p.category_id && !(await unwrap(sb.from('categories').select('id').eq('id', p.category_id).maybeSingle()))) throw bad('Category not found.');
+  const [cat, sub] = await Promise.all([
+    p.category_id ? unwrap(sb.from('categories').select('id').eq('id', p.category_id).maybeSingle()) : null,
+    p.subcategory_id ? unwrap(sb.from('subcategories').select('category_id').eq('id', p.subcategory_id).maybeSingle()) : null,
+  ]);
+  if (p.category_id && !cat) throw bad('Category not found.');
   if (p.subcategory_id) {
-    const s = await unwrap(sb.from('subcategories').select('category_id').eq('id', p.subcategory_id).maybeSingle());
-    if (!s) throw bad('Subcategory not found.');
-    if (s.category_id !== p.category_id) throw bad('That subcategory does not belong to the chosen category.');
+    if (!sub) throw bad('Subcategory not found.');
+    if (sub.category_id !== p.category_id) throw bad('That subcategory does not belong to the chosen category.');
   }
   return p;
 }
@@ -111,15 +114,18 @@ admin.post('/products', async (req, res) => {
 
 admin.put('/products/:id', async (req, res) => {
   const id = Number(req.params.id);
-  const existing = await getProduct(id);
-  const p = await cleanProduct({ ...req.body, code: req.body?.code || existing.code }, existing);
+  const p = await cleanProduct(req.body || {});
+  const fields = pick(p);
+  if (!fields.code) delete fields.code; // blank means keep the current code
   // Stock is changed through Receive / Sale / Adjust so the history stays correct; edits here never touch it.
+  let rows;
   try {
-    await unwrap(sb.from('products').update({ ...pick(p), updated_at: now() }).eq('id', id));
+    rows = await unwrap(sb.from('products').update({ ...fields, updated_at: now() }).eq('id', id).select(PRODUCT_COLS));
   } catch (e) {
     throw duplicateError(e);
   }
-  res.json(await getProduct(id));
+  if (!rows.length) throw new HttpError(404, 'Product not found.');
+  res.json(withImage(rows[0]));
 });
 
 // ---- images (the browser shrinks the photo first; we still verify type and size here)
@@ -127,29 +133,33 @@ const IMG_TYPES = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp
 
 admin.post('/products/:id/image', async (req, res) => {
   const id = Number(req.params.id);
-  const old = await getProduct(id, true);
   const m = /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(req.body?.dataUrl || '');
   if (!m) throw bad('Please choose a JPG, PNG or WebP image.');
   if (!storage.enabled) throw new HttpError(503, 'Photo storage is not set up. Add SUPABASE_URL and SUPABASE_ANON_KEY to .env.');
   const buf = Buffer.from(m[2], 'base64');
   if (buf.length > 2 * 1024 * 1024) throw bad('Image is too large (max 2 MB).');
   const file = `p${id}-${Date.now()}.${IMG_TYPES[m[1]]}`;
-  try {
-    await storage.upload(file, buf, m[1]);
-  } catch (e) {
-    throw new HttpError(502, e.message);
-  }
-  await unwrap(sb.from('products').update({ image: file, updated_at: now() }).eq('id', id));
-  await storage.remove(old.image);
-  res.json(await getProduct(id));
+  const [old] = await Promise.all([
+    getProduct(id, true),
+    storage.upload(file, buf, m[1]).catch((e) => {
+      throw new HttpError(502, e.message);
+    }),
+  ]);
+  const [rows] = await Promise.all([
+    unwrap(sb.from('products').update({ image: file, updated_at: now() }).eq('id', id).select(PRODUCT_COLS)),
+    storage.remove(old.image),
+  ]);
+  res.json(withImage(rows[0]));
 });
 
 admin.delete('/products/:id/image', async (req, res) => {
   const id = Number(req.params.id);
   const old = await getProduct(id, true);
-  await unwrap(sb.from('products').update({ image: null, updated_at: now() }).eq('id', id));
-  await storage.remove(old.image);
-  res.json(await getProduct(id));
+  const [rows] = await Promise.all([
+    unwrap(sb.from('products').update({ image: null, updated_at: now() }).eq('id', id).select(PRODUCT_COLS)),
+    storage.remove(old.image),
+  ]);
+  res.json(withImage(rows[0]));
 });
 
 // ---- categories

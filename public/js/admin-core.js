@@ -19,6 +19,16 @@ export async function reloadAndRender() {
   views[currentTab]?.render($('#view'));
   updateBadge();
 }
+// Put one product (from the server, or an optimistic copy) into the local list and redraw. No catalogue re-download.
+export function upsertProduct(p) {
+  const i = S.products.findIndex((x) => x.id === p.id);
+  if (i < 0) S.products.push(p);
+  else S.products[i] = p;
+  S.products.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
+  S.index = buildIndex(S.products, S.categories, { withCode: true });
+  views[currentTab]?.render($('#view'));
+  updateBadge();
+}
 export function updateBadge() {
   const n = S.products.filter(isLow).length;
   const b = $('#stockBadge');

@@ -1,6 +1,6 @@
 // Admin: Products tab, product dialog, categories.
 import { $, esc, api, toast, openModal, icon, debounce, thumb } from './common.js';
-import { S, actions, views, reloadAndRender, adminCardHtml, search, catOf, showError } from './admin-core.js';
+import { S, actions, views, reloadAndRender, upsertProduct, adminCardHtml, search, catOf, showError } from './admin-core.js';
 
 const PAGE = 60;
 const f = { q: '', status: 'all', cat: '', shown: PAGE };
@@ -181,18 +181,48 @@ export function openProductForm(p) {
     else { body.stock = d.stock; body.reorder_qty = d.reorder_qty; body.last_purchase_price = d.last_purchase_price; }
     const btn = $('#pfsave', el);
     btn.disabled = true;
+    const image = pendingImage;
+    const dropImage = removeImage && d.image;
     try {
-      const saved = isNew ? await api('/api/admin/products', { method: 'POST', body }) : await api(`/api/admin/products/${p.id}`, { method: 'PUT', body });
-      if (pendingImage) await api(`/api/admin/products/${saved.id}/image`, { method: 'POST', body: { dataUrl: pendingImage } });
-      else if (removeImage && d.image) await api(`/api/admin/products/${saved.id}/image`, { method: 'DELETE' });
-      toast(isNew ? 'Product added' : 'Saved', 'ok');
+      if (isNew) {
+        const saved = await api('/api/admin/products', { method: 'POST', body });
+        upsertProduct(saved);
+        toast('Product added', 'ok');
+        close();
+        if (image) uploadInBackground(saved.id, image);
+        return;
+      }
+      // Edit: show the change on screen right now, then save in the background.
+      const n = (x) => (x === '' || x == null || Number.isNaN(Number(x)) ? null : Number(x));
+      upsertProduct({
+        ...p, ...body, category_id: n(body.category_id), subcategory_id: n(body.subcategory_id), cost_price: n(body.cost_price), sell_price: n(body.sell_price),
+        min_stock: n(body.min_stock), target_stock: n(body.target_stock), active: body.active ? 1 : 0,
+        image: image || (dropImage ? null : p.image),
+      });
+      toast('Saved', 'ok');
       close();
-      await reloadAndRender();
+      try {
+        let saved = await api(`/api/admin/products/${p.id}`, { method: 'PUT', body });
+        if (image) saved = await api(`/api/admin/products/${p.id}/image`, { method: 'POST', body: { dataUrl: image } });
+        else if (dropImage) saved = await api(`/api/admin/products/${p.id}/image`, { method: 'DELETE' });
+        upsertProduct(saved);
+      } catch (ex) {
+        toast('Not saved: ' + ex.message, 'err');
+        await reloadAndRender(); // put the screen back to what is really stored
+      }
     } catch (ex) {
       showError(err, ex.message);
       btn.disabled = false;
     }
   };
+}
+// The product is already on screen; the photo follows as soon as it is uploaded.
+async function uploadInBackground(id, dataUrl) {
+  try {
+    upsertProduct(await api(`/api/admin/products/${id}/image`, { method: 'POST', body: { dataUrl } }));
+  } catch (ex) {
+    toast('Product saved, but the photo failed: ' + ex.message, 'err');
+  }
 }
 actions.edit = openProductForm;
 
